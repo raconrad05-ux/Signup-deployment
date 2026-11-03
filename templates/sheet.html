@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Sign-up sheet{% endblock %}
+{% block content %}
+  <h1>Sign-up sheet</h1>
+  <p>Office hours run Monday to Friday, 2:00 to 4:00 pm, in half-hour slots.
+    {% if g.is_admin %}You are the administrator and can see who booked each slot.{% endif %}
+  </p>
+
+  <table class="sheet">
+    <thead>
+      <tr>
+        <th></th>
+        {% for day in days %}<th>{{ day }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in grid %}
+        <tr>
+          <th>{{ row.start | ampm }} &ndash; {{ row.end | ampm }}</th>
+          {% for cell in row.cells %}
+            <td class="{{ cell.status }}">
+              {% if cell.status == 'free' %}
+                <form method="post" action="{{ url_for('book') }}">
+                  <input type="hidden" name="weekday" value="{{ cell.weekday }}">
+                  <input type="hidden" name="start" value="{{ cell.start }}">
+                  <button type="submit">Book</button>
+                </form>
+              {% elif cell.status == 'mine' %}
+                <span>Yours</span>
+                <form method="post" action="{{ url_for('cancel') }}">
+                  <input type="hidden" name="weekday" value="{{ cell.weekday }}">
+                  <input type="hidden" name="start" value="{{ cell.start }}">
+                  <button type="submit">Cancel</button>
+                </form>
+              {% elif g.is_admin %}
+                <span>Taken by <strong>{{ cell.username }}</strong></span>
+              {% else %}
+                <span>Taken</span>
+              {% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
