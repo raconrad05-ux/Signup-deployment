@@ -1,16 +1,39 @@
+import atexit
 import os
 import sys
-import tempfile
+import uuid
 from pathlib import Path
 
 os.chdir(Path(__file__).resolve().parent)
 sys.path.insert(0, os.getcwd())
 
+import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
 import app as appmod
 
-# Use a throwaway DB so the smoke test doesn't touch signup.db.
-tmp = Path(tempfile.mkdtemp()) / "test.db"
-appmod.DATABASE = tmp
+# Use TEST_DATABASE_URL if set, otherwise DATABASE_URL. Either way the test runs
+# in a throwaway schema so it doesn't touch the real tables. Schema search_path
+# only works on a direct (non-pooled) connection, so drop "-pooler" from the
+# Neon host name.
+test_url = os.environ.get("TEST_DATABASE_URL", "").strip() or appmod.DATABASE_URL
+params = conninfo_to_dict(test_url)
+params["host"] = params["host"].replace("-pooler", "")
+direct_url = make_conninfo(**params)
+schema = f"smoke_{uuid.uuid4().hex[:8]}"
+with psycopg.connect(direct_url, autocommit=True) as conn:
+    conn.execute(f"CREATE SCHEMA {schema}")
+
+
+def drop_schema():
+    with psycopg.connect(direct_url, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA {schema} CASCADE")
+
+
+atexit.register(drop_schema)
+
+appmod.DATABASE_URL = make_conninfo(direct_url, options=f"-c search_path={schema}")
+appmod.ADMIN_USERNAME = "alice"
 appmod.init_db()
 appmod.app.config["TESTING"] = True
 c = appmod.app.test_client()
@@ -43,8 +66,8 @@ r = c.post("/logout", follow_redirects=True)
 assert "Please log in first" in body(r), body(r)
 
 # Password must be hashed, not stored in plain text.
-import sqlite3
-row = sqlite3.connect(tmp).execute("SELECT password_hash FROM users").fetchone()
+with psycopg.connect(appmod.DATABASE_URL) as conn:
+    row = conn.execute("SELECT password_hash FROM users").fetchone()
 assert row[0] != "pw" and row[0].startswith(("scrypt:", "pbkdf2:")), row
 
 # --- Sign-up sheet ---------------------------------------------------------
@@ -60,7 +83,7 @@ assert "Please log in first" in body(r), body(r)
 
 c.post("/register", data={"username": "bob", "password": "pw"})
 
-# alice registered first, so she is the administrator.
+# alice is ADMIN_USERNAME, so she is the administrator.
 login("alice")
 r = c.get("/sheet")
 assert r.status_code == 200 and "You are the administrator" in body(r), body(r)

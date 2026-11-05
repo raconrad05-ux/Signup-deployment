@@ -1,6 +1,9 @@
-import sqlite3
+import os
 from functools import wraps
-from pathlib import Path
+
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
 from flask import (
     Flask,
@@ -14,20 +17,38 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE = BASE_DIR / "signup.db"
+# Settings come from environment variables; locally they are read from .env.
+load_dotenv()
+
+
+def require_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Environment variable {name} is not set (see .env).")
+    return value
+
+
+DATABASE_URL = require_env("DATABASE_URL")
+SITE_NAME = os.environ.get("SITE_NAME", "Office Hours").strip()
+ADMIN_USERNAME = require_env("ADMIN_USERNAME")
 
 app = Flask(__name__)
-# Replace with a fixed random value (e.g. via an environment variable) before deploying.
-app.config["SECRET_KEY"] = "dev-change-me"
+app.config["SECRET_KEY"] = require_env("SECRET_KEY")
+# Cloud Run sets K_SERVICE and serves over HTTPS, so only send the session
+# cookie over HTTPS there; on a laptop the app runs over plain http://.
+app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("K_SERVICE"))
+
+
+@app.context_processor
+def inject_site_name():
+    return {"site_name": SITE_NAME}
 
 
 # --- Database helpers -------------------------------------------------------
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     return g.db
 
 
@@ -39,11 +60,11 @@ def close_db(_exc):
 
 
 def init_db():
-    with sqlite3.connect(DATABASE) as db:
+    with psycopg.connect(DATABASE_URL) as db:
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL
             )
@@ -52,7 +73,7 @@ def init_db():
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS bookings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 weekday INTEGER NOT NULL,
                 start TEXT NOT NULL,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -99,11 +120,8 @@ def parse_slot(form):
 
 
 def is_admin(user):
-    """The first user who registered is the administrator."""
-    if user is None:
-        return False
-    first = get_db().execute("SELECT MIN(id) AS id FROM users").fetchone()
-    return first["id"] == user["id"]
+    """The administrator is the user named by ADMIN_USERNAME."""
+    return user is not None and user["username"] == ADMIN_USERNAME
 
 
 # --- Auth helpers -----------------------------------------------------------
@@ -115,7 +133,7 @@ def load_current_user():
         g.user = None
     else:
         g.user = get_db().execute(
-            "SELECT id, username FROM users WHERE id = ?", (user_id,)
+            "SELECT id, username FROM users WHERE id = %s", (user_id,)
         ).fetchone()
         if g.user is None:
             session.clear()
@@ -154,11 +172,11 @@ def register():
             db = get_db()
             try:
                 db.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                    "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
                     (username, generate_password_hash(password)),
                 )
                 db.commit()
-            except sqlite3.IntegrityError:
+            except psycopg.errors.UniqueViolation:
                 flash(f"Username '{username}' is already taken.")
             else:
                 flash("Account created. You can log in now.")
@@ -174,7 +192,7 @@ def login():
         password = request.form.get("password", "")
 
         user = get_db().execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
+            "SELECT * FROM users WHERE username = %s", (username,)
         ).fetchone()
 
         if user is None or not check_password_hash(user["password_hash"], password):
@@ -244,11 +262,11 @@ def book():
     db = get_db()
     try:
         db.execute(
-            "INSERT INTO bookings (weekday, start, user_id) VALUES (?, ?, ?)",
+            "INSERT INTO bookings (weekday, start, user_id) VALUES (%s, %s, %s)",
             (weekday, start, g.user["id"]),
         )
         db.commit()
-    except sqlite3.IntegrityError:
+    except psycopg.errors.UniqueViolation:
         flash("Sorry, that slot has already been taken.")
     else:
         flash(f"Booked {DAYS[weekday]} at {format_time(start)}.")
@@ -267,7 +285,7 @@ def cancel():
     db = get_db()
     # Only the person who booked a slot may cancel it.
     deleted = db.execute(
-        "DELETE FROM bookings WHERE weekday = ? AND start = ? AND user_id = ?",
+        "DELETE FROM bookings WHERE weekday = %s AND start = %s AND user_id = %s",
         (weekday, start, g.user["id"]),
     ).rowcount
     db.commit()
